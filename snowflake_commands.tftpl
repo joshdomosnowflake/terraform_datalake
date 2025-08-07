@@ -1,0 +1,32 @@
+-- Step 1: Create storage integration (run this first)
+CREATE OR REPLACE STORAGE INTEGRATION ${project_name}_s3_integration
+   TYPE = EXTERNAL_STAGE
+   STORAGE_PROVIDER = 'S3'
+   ENABLED = TRUE
+   STORAGE_AWS_ROLE_ARN = '${role_arn}'
+   STORAGE_ALLOWED_LOCATIONS = ('s3://${bucket_name}/warehouse/');
+
+-- Step 2: Get external ID (copy from DESC output)
+DESC STORAGE INTEGRATION ${project_name}_s3_integration;
+
+-- Step 3: After updating Terraform with external ID, create external volume
+CREATE OR REPLACE EXTERNAL VOLUME ${project_name}_iceberg_volume
+   STORAGE_LOCATIONS = (
+       (
+           NAME = 'iceberg_location'
+           STORAGE_PROVIDER = 'S3'
+           STORAGE_BASE_URL = 's3://${bucket_name}/warehouse/'
+           STORAGE_INTEGRATION = '${project_name}_s3_integration'
+       )
+   );
+
+-- Step 4: Create Iceberg catalog
+CREATE OR REPLACE ICEBERG CATALOG ${project_name}_catalog
+   CATALOG_SOURCE = 'GLUE'
+   TABLE_FORMAT = 'ICEBERG'
+   CATALOG_NAMESPACE = '${database_name}'
+   EXTERNAL_VOLUME = '${project_name}_iceberg_volume';
+
+-- Step 5: Test querying your tables
+SELECT * FROM ${project_name}_catalog.${database_name}.shows LIMIT 10;
+SELECT * FROM ${project_name}_catalog.${database_name}.episodes LIMIT 10;

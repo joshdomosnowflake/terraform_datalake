@@ -105,14 +105,16 @@ resource "aws_glue_job" "graphql_job" {
     "--enable-continuous-cloudwatch-log" = "true"
     "--enable-glue-datacatalog"          = "true"
     
-    # Add Iceberg support via Maven coordinates (easier than managing JARs)
-    "--extra-jars"                       = "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.3_2.12/1.3.1/iceberg-spark-runtime-3.3_2.12-1.3.1.jar"
-    
-    # Alternative: Use --additional-python-modules for Python deps
-    "--additional-python-modules"        = "requests==2.28.2,gql[all]==3.4.1"
+    # Add ALL required Iceberg JARs with dependencies
+    "--extra-jars" = join(",", [
+      "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.3_2.12/1.3.1/iceberg-spark-runtime-3.3_2.12-1.3.1.jar",
+      "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws/1.3.1/iceberg-aws-1.3.1.jar",
+      "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/2.20.18/bundle-2.20.18.jar",
+      "https://repo1.maven.org/maven2/software/amazon/awssdk/url-connection-client/2.20.18/url-connection-client-2.20.18.jar"
+    ])
     
     # Iceberg + Glue Catalog configuration
-    "--conf"                            = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://${aws_s3_bucket.data_lake.bucket}/warehouse/ --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO"
+    "--conf" = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://${aws_s3_bucket.data_lake.bucket}/warehouse/ --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO"
     
     # Your application arguments
     "--GRAPHQL_ENDPOINT"                = var.graphql_endpoint
@@ -122,6 +124,7 @@ resource "aws_glue_job" "graphql_job" {
     "--DATABASE_NAME"                   = aws_glue_catalog_database.data_lake_db.name
     "--TABLE_NAME_SHOWS"                = "shows"
     "--TABLE_NAME_EPISODES"             = "episodes"
+    "--additional-python-modules"       = "requests==2.28.2,gql[all]==3.4.1"
   }
 
   max_capacity = 2
@@ -144,8 +147,9 @@ resource "aws_s3_object" "glue_script" {
   }
 }
 
-# IAM role for Snowflake to access S3 (initial version)
 resource "aws_iam_role" "snowflake_s3_role" {
+  count = var.enable_snowflake_integration ? 1 : 0
+  
   name = "${var.project_name}-snowflake-s3-role"
 
   assume_role_policy = jsonencode({
@@ -154,19 +158,30 @@ resource "aws_iam_role" "snowflake_s3_role" {
       {
         Effect = "Allow"
         Principal = {
-          # Use Snowflake's standard AWS account ID (this is public info)
-          AWS = "arn:aws:iam::834032919186:user/s3-external-stage"
+          AWS = var.snowflake_aws_iam_user_arn
         }
         Action = "sts:AssumeRole"
-        # We'll add the external ID condition later
+        Condition = var.snowflake_aws_external_id != "" ? {
+          StringEquals = {
+            "sts:ExternalId" = var.snowflake_aws_external_id
+          }
+        } : {}
       }
     ]
   })
+
+  tags = {
+    Name        = "${var.project_name}-snowflake-role"
+    Environment = var.environment
+    Purpose     = "Snowflake S3 Integration"
+  }
 }
 
 resource "aws_iam_role_policy" "snowflake_s3_policy" {
+  count = var.enable_snowflake_integration ? 1 : 0
+  
   name = "${var.project_name}-snowflake-s3-policy"
-  role = aws_iam_role.snowflake_s3_role.id
+  role = aws_iam_role.snowflake_s3_role[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -189,7 +204,8 @@ resource "aws_iam_role_policy" "snowflake_s3_policy" {
           "glue:GetTable",
           "glue:GetDatabase",
           "glue:GetPartitions",
-          "glue:GetTables"
+          "glue:GetTables",
+          "glue:GetDatabases"
         ]
         Resource = "*"
       }
@@ -197,8 +213,23 @@ resource "aws_iam_role_policy" "snowflake_s3_policy" {
   })
 }
 
-# Output the ARN so you can use it in Snowflake
-output "snowflake_iam_role_arn" {
-  description = "IAM Role ARN for Snowflake to assume"
-  value       = aws_iam_role.snowflake_s3_role.arn
+# Outputs for Snowflake configuration
+output "snowflake_role_arn" {
+  description = "IAM Role ARN for Snowflake integration"
+  value       = var.enable_snowflake_integration ? aws_iam_role.snowflake_s3_role[0].arn : "Not enabled"
+}
+
+output "data_lake_warehouse_path" {
+  description = "S3 warehouse path for Snowflake external volume"
+  value       = "s3://${aws_s3_bucket.data_lake.bucket}/warehouse/"
+}
+
+output "snowflake_setup_commands" {
+  description = "Snowflake SQL commands to run (after getting external ID)"
+  value = var.enable_snowflake_integration ? templatefile("${path.module}/snowflake_commands.tftpl", {
+    project_name   = var.project_name
+    role_arn       = aws_iam_role.snowflake_s3_role[0].arn
+    bucket_name    = aws_s3_bucket.data_lake.bucket
+    database_name  = aws_glue_catalog_database.data_lake_db.name
+  }) : "Snowflake integration not enabled"
 }
