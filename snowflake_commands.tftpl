@@ -1,4 +1,4 @@
--- Step 1: Create storage integration (run this first)
+-- Step 1: Create storage integration for S3 access
 CREATE OR REPLACE STORAGE INTEGRATION ${project_name}_s3_integration
    TYPE = EXTERNAL_STAGE
    STORAGE_PROVIDER = 'S3'
@@ -6,27 +6,66 @@ CREATE OR REPLACE STORAGE INTEGRATION ${project_name}_s3_integration
    STORAGE_AWS_ROLE_ARN = '${role_arn}'
    STORAGE_ALLOWED_LOCATIONS = ('s3://${bucket_name}/warehouse/');
 
--- Step 2: Get external ID (copy from DESC output)
+-- Step 2: Get external ID (run DESC and update Terraform)
 DESC STORAGE INTEGRATION ${project_name}_s3_integration;
 
--- Step 3: After updating Terraform with external ID, create external volume
-CREATE OR REPLACE EXTERNAL VOLUME ${project_name}_iceberg_volume
+-- Step 3: Create external volume using the storage integration
+CREATE OR REPLACE EXTERNAL VOLUME ${project_name}_external_volume
    STORAGE_LOCATIONS = (
        (
            NAME = 'iceberg_location'
            STORAGE_PROVIDER = 'S3'
            STORAGE_BASE_URL = 's3://${bucket_name}/warehouse/'
-           STORAGE_INTEGRATION = '${project_name}_s3_integration'
+           STORAGE_AWS_ROLE_ARN = '${role_arn}'
+           STORAGE_AWS_EXTERNAL_ID = '${external_id}'
        )
    );
 
--- Step 4: Create Iceberg catalog
-CREATE OR REPLACE ICEBERG CATALOG ${project_name}_catalog
-   CATALOG_SOURCE = 'GLUE'
-   TABLE_FORMAT = 'ICEBERG'
+-- Step 4: Create catalog integration using Iceberg REST API
+CREATE OR REPLACE CATALOG INTEGRATION ${project_name}_glue_integration
+   CATALOG_SOURCE = ICEBERG_REST
+   TABLE_FORMAT = ICEBERG
    CATALOG_NAMESPACE = '${database_name}'
-   EXTERNAL_VOLUME = '${project_name}_iceberg_volume';
+   REST_CONFIG = (
+       CATALOG_URI = 'https://glue.${aws_region}.amazonaws.com/iceberg'
+       CATALOG_API_TYPE = AWS_GLUE
+       CATALOG_NAME = '${aws_account_id}'
+   )
+   REST_AUTHENTICATION = (
+       TYPE = SIGV4
+       SIGV4_IAM_ROLE = '${role_arn}'
+       SIGV4_SIGNING_REGION = '${aws_region}'
+   )
+   ENABLED = TRUE;
 
--- Step 5: Test querying your tables
-SELECT * FROM ${project_name}_catalog.${database_name}.shows LIMIT 10;
-SELECT * FROM ${project_name}_catalog.${database_name}.episodes LIMIT 10;
+-- Step 5: Create Snowflake database and schema for Iceberg tables
+CREATE OR REPLACE DATABASE ${project_name}_db;
+USE DATABASE ${project_name}_db;
+
+CREATE OR REPLACE SCHEMA iceberg_tables;
+USE SCHEMA iceberg_tables;
+
+-- Step 6: Set default external volume for the database
+ALTER DATABASE ${project_name}_db SET EXTERNAL_VOLUME = '${project_name}_external_volume';
+
+-- Step 7: Create Iceberg tables that reference the external catalog
+CREATE OR REPLACE ICEBERG TABLE ${project_name}_db.iceberg_tables.shows
+   EXTERNAL_VOLUME = '${project_name}_external_volume'
+   CATALOG = '${project_name}_glue_integration'
+   CATALOG_TABLE_NAME = '${database_name}.shows';
+
+CREATE OR REPLACE ICEBERG TABLE ${project_name}_db.iceberg_tables.episodes
+   EXTERNAL_VOLUME = '${project_name}_external_volume'
+   CATALOG = '${project_name}_glue_integration'
+   CATALOG_TABLE_NAME = '${database_name}.episodes';
+
+-- Step 8: Test querying the Iceberg tables
+SELECT * FROM ${project_name}_db.iceberg_tables.shows LIMIT 10;
+SELECT * FROM ${project_name}_db.iceberg_tables.episodes LIMIT 10;
+
+-- Step 9: Test Iceberg-specific features
+SELECT * FROM ${project_name}_db.iceberg_tables.shows FOR SYSTEM_TIME AS OF '2025-01-07 10:00:00'::timestamp_ltz;
+
+-- Step 10: Show table information
+DESCRIBE TABLE ${project_name}_db.iceberg_tables.shows;
+SHOW ICEBERG TABLES IN SCHEMA ${project_name}_db.iceberg_tables;

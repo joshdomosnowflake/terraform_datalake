@@ -158,9 +158,11 @@ resource "aws_iam_role" "snowflake_s3_role" {
       {
         Effect = "Allow"
         Principal = {
-          AWS = var.snowflake_aws_iam_user_arn
+          # Use temporary principal if Snowflake values aren't provided yet
+          AWS = var.snowflake_aws_iam_user_arn != "" ? var.snowflake_aws_iam_user_arn : "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
         }
         Action = "sts:AssumeRole"
+        # Only add external ID condition if it's provided
         Condition = var.snowflake_aws_external_id != "" ? {
           StringEquals = {
             "sts:ExternalId" = var.snowflake_aws_external_id
@@ -180,7 +182,7 @@ resource "aws_iam_role" "snowflake_s3_role" {
 resource "aws_iam_role_policy" "snowflake_s3_policy" {
   count = var.enable_snowflake_integration ? 1 : 0
   
-  name = "${var.project_name}-snowflake-s3-policy"
+  name = "${var.project_name}-snowflake-policy"
   role = aws_iam_role.snowflake_s3_role[0].id
 
   policy = jsonencode({
@@ -201,11 +203,21 @@ resource "aws_iam_role_policy" "snowflake_s3_policy" {
       {
         Effect = "Allow"
         Action = [
+          # Standard Glue permissions
           "glue:GetTable",
           "glue:GetDatabase",
           "glue:GetPartitions",
           "glue:GetTables",
-          "glue:GetDatabases"
+          "glue:GetDatabases",
+          "glue:BatchGetPartition",
+          
+          # Additional permissions for Iceberg REST API
+          "glue:UpdateTable",
+          "glue:CreateTable",
+          "glue:DeleteTable",
+          "glue:BatchCreatePartition",
+          "glue:BatchDeletePartition",
+          "glue:BatchUpdatePartition"
         ]
         Resource = "*"
       }
@@ -227,9 +239,12 @@ output "data_lake_warehouse_path" {
 output "snowflake_setup_commands" {
   description = "Snowflake SQL commands to run (after getting external ID)"
   value = var.enable_snowflake_integration ? templatefile("${path.module}/snowflake_commands.tftpl", {
-    project_name   = var.project_name
+    project_name   = replace(var.project_name, "-", "_")  # Clean the project name
     role_arn       = aws_iam_role.snowflake_s3_role[0].arn
     bucket_name    = aws_s3_bucket.data_lake.bucket
     database_name  = aws_glue_catalog_database.data_lake_db.name
+    aws_account_id = data.aws_caller_identity.current.account_id
+    aws_region     = var.aws_region  # Use the variable instead of data source
+    external_id      = var.snowflake_aws_external_id  # Add this
   }) : "Snowflake integration not enabled"
 }

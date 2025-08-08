@@ -1,2 +1,5 @@
 *.tfstate*
 .terraform/
+*.local
+.DS_Store
+*.lock*
