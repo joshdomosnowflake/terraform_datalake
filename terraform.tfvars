@@ -13,6 +13,8 @@ query {
       id    
       title {
         english
+        romaji
+        native
       }
       meanScore
       description
